@@ -128,7 +128,7 @@ SYSTEM_PROMPT = """
 - Не агитируй и не продвигай политические силы
 - Объясняй учебно и нейтрально
 - Отвечай как сильный репетитор, а не как сухая энциклопедия
-"""
+""".strip()
 
 # ------------------- MODULES -------------------
 MODULES = {
@@ -286,7 +286,6 @@ def build_progress_text(user_id: int) -> str:
     progress = get_user_progress(user_id)
     completed = progress["completed_lessons"]
     current = progress["current_lesson"] or "ещё не выбран"
-
     total_lessons = sum(len(module["lessons"]) for module in MODULES.values())
 
     return (
@@ -333,6 +332,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not module:
             await query.edit_message_text("Такого модуля нет.", reply_markup=modules_keyboard())
             return
+
         await query.edit_message_text(
             f"{module['name']}\n\nВыбери урок:",
             reply_markup=lessons_keyboard(module_id)
@@ -355,8 +355,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lesson_prompt = (
             f"Начни урок {lesson_id} по программе. "
-            f"Проведи полный урок по структуре: что это, почему важно, как работает, пример, с чем путают, ошибка новичка, 2-3 вопроса на закрепление. "
-            f"В конце обязательно дай домашнее задание и предложи следующий урок."
+            "Проведи полный урок по структуре: что это, почему важно, как работает, пример, с чем путают, ошибка новичка, 2-3 вопроса на закрепление. "
+            "В конце обязательно дай домашнее задание и предложи следующий урок."
         )
 
         history.append({"role": "user", "content": lesson_prompt})
@@ -385,15 +385,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logging.exception("Ошибка в уроке: %s", e)
-            await context.bot.send_message(chat_id=query.message.chat_id, text="Ошибка, попробуй ещё раз.")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Ошибка, попробуй ещё раз."
+            )
         return
 
     if data.startswith("complete_"):
         lesson_id = data.split("_", 1)[1]
         mark_lesson_completed(user_id, lesson_id)
         await query.edit_message_text(
-            f"Урок {lesson_id} отмечен как пройденный.\n\n"
-            f"{build_progress_text(user_id)}",
+            f"Урок {lesson_id} отмечен как пройденный.\n\n{build_progress_text(user_id)}",
             reply_markup=main_menu_keyboard(),
         )
         return
