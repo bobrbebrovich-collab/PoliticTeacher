@@ -1,583 +1,445 @@
 import os
-import json
 import logging
-import sqlite3
-from datetime import datetime
-from typing import Optional
-
-from xai_sdk import Client
-from telegram import ReplyKeyboardMarkup, Update
+from groq import Groq
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
     MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
     filters,
+    ContextTypes,
 )
 
-# =========================
-# НАСТРОЙКИ
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
-DB_PATH = os.getenv("DB_PATH", "politics_tutor.db")
-
-if not BOT_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN")
-if not XAI_API_KEY:
-    raise RuntimeError("Не найден XAI_API_KEY")
-
+# ------------------- LOGGING -------------------
 logging.basicConfig(
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-client = Client(api_key=XAI_API_KEY)
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["📚 Начать обучение", "🧠 Выбрать тему"],
-        ["❓ Задать вопрос", "📝 Мини-тест"],
-        ["📈 Мой прогресс", "🔁 Повторить тему"],
-        ["⚙️ Сменить уровень", "ℹ️ Помощь"],
-    ],
-    resize_keyboard=True,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 
-TOPIC_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["Государство", "Формы правления"],
-        ["Демократия", "Авторитаризм"],
-        ["Либерализм", "Консерватизм"],
-        ["Социализм", "Национализм"],
-        ["Французская революция", "Первая мировая"],
-        ["Вторая мировая", "Холодная война"],
-        ["СССР", "Международные отношения"],
-        ["⬅️ Назад"],
-    ],
-    resize_keyboard=True,
-)
+# ------------------- ENV KEYS -------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-LEVELS = ["Новичок", "Школьник", "Студент", "Продвинутый"]
-LEVEL_KEYBOARD = ReplyKeyboardMarkup(
-    [[level] for level in LEVELS] + [["⬅️ Назад"]],
-    resize_keyboard=True,
-)
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задан GROQ_API_KEY")
 
+client = Groq(api_key=GROQ_API_KEY)
+
+# Простая память в оперативке
+chat_histories = {}
+user_progress = {}
+
+# ------------------- SYSTEM PROMPT -------------------
 SYSTEM_PROMPT = """
-Ты — AI-репетитор по политике, политологии, истории, идеологиям и международным отношениям.
+Ты — личный AI-репетитор по политике, политологии, истории, идеологиям, государственному устройству и международным отношениям.
 
-Твои правила:
-1. Объясняй по-русски, ясно, спокойно и по шагам.
-2. Не пиши как сухая энциклопедия. Объясняй как сильный репетитор.
-3. Всегда учитывай уровень ученика: Новичок, Школьник, Студент, Продвинутый.
-4. Если тема сложная, сначала дай простое объяснение, потом структуру, потом примеры.
-5. Когда уместно, раскрывай:
-   - определение
-   - причины
-   - суть
-   - примеры
-   - последствия
-   - сравнение с похожими явлениями
-6. Если пользователь просит тему для изучения, строй мини-урок:
-   - Что это
-   - Почему это важно
-   - Ключевые идеи / события
-   - Пример
-   - Краткий вывод
-   - 2–3 вопроса на закрепление
-7. Если пользователь задаёт вопрос по событию, объясняй контекст, участников, причины и последствия.
-8. Если пользователь просит сравнение идеологий или режимов, делай понятную сравнительную подачу.
-9. Не выдумывай факты. Если в чём-то не уверен, прямо скажи об этом.
-10. Не агитируй за политические силы. Объясняй нейтрально и учебно.
-11. Не перегружай ответ лишними датами, если пользователь не просил глубокий уровень.
-12. Завершай обучение вопросом или мини-проверкой, если это уместно.
-""".strip()
+ТВОЯ ЦЕЛЬ:
+Обучать ученика политике с нуля до уверенного понимания тем:
+- что такое государство и власть
+- формы правления
+- политические режимы
+- идеологии
+- важнейшие исторические события
+- международные отношения
+- сравнение стран, систем и эпох
 
-HELP_TEXT = """
-Я — бот-репетитор по политике и истории.
+ПРОГРАММА ОБУЧЕНИЯ:
 
-Что я умею:
-- объяснять политические темы по шагам
-- разбирать идеологии и формы правления
-- рассказывать про исторические события
-- задавать вопросы для закрепления
-- делать мини-тесты
-- подстраиваться под твой уровень
+МОДУЛЬ 1 — БАЗА ПОЛИТИКИ
+  Урок 1.1: Что такое политика
+  Урок 1.2: Что такое государство
+  Урок 1.3: Что такое власть
+  Урок 1.4: Суверенитет, закон, легитимность
+  Урок 1.5: Общество, элиты, институты
 
-Команды:
-/start — запуск
-/help — помощь
-/reset — сбросить историю диалога
-/topic — выбрать тему
-/level — сменить уровень
-/progress — посмотреть прогресс
-""".strip()
+МОДУЛЬ 2 — ГОСУДАРСТВЕННОЕ УСТРОЙСТВО
+  Урок 2.1: Монархия и республика
+  Урок 2.2: Парламентская и президентская система
+  Урок 2.3: Федерация и унитарное государство
+  Урок 2.4: Разделение властей
+  Урок 2.5: Конституция и законы
 
+МОДУЛЬ 3 — ПОЛИТИЧЕСКИЕ РЕЖИМЫ
+  Урок 3.1: Демократия
+  Урок 3.2: Авторитаризм
+  Урок 3.3: Тоталитаризм
+  Урок 3.4: Диктатура и признаки режима
+  Урок 3.5: Сравнение режимов
 
-# =========================
-# БАЗА ДАННЫХ
-# =========================
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+МОДУЛЬ 4 — ИДЕОЛОГИИ
+  Урок 4.1: Либерализм
+  Урок 4.2: Консерватизм
+  Урок 4.3: Социализм
+  Урок 4.4: Коммунизм
+  Урок 4.5: Национализм
+  Урок 4.6: Фашизм
+  Урок 4.7: Сравнение идеологий
 
+МОДУЛЬ 5 — ИСТОРИЧЕСКИЕ СОБЫТИЯ
+  Урок 5.1: Французская революция
+  Урок 5.2: Наполеон и Европа
+  Урок 5.3: Первая мировая война
+  Урок 5.4: Вторая мировая война
+  Урок 5.5: СССР
+  Урок 5.6: Холодная война
+  Урок 5.7: Распад СССР
 
-def init_db() -> None:
-    conn = get_db()
-    cur = conn.cursor()
+МОДУЛЬ 6 — МЕЖДУНАРОДНЫЕ ОТНОШЕНИЯ
+  Урок 6.1: Что такое геополитика
+  Урок 6.2: Государства и интересы
+  Урок 6.3: Союзы и блоки
+  Урок 6.4: ООН, НАТО, ЕС
+  Урок 6.5: Причины конфликтов
+  Урок 6.6: Санкции, дипломатия, баланс сил
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            level TEXT DEFAULT 'Новичок',
-            current_topic TEXT,
-            messages_count INTEGER DEFAULT 0,
-            tests_count INTEGER DEFAULT 0,
-            last_seen TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+МОДУЛЬ 7 — ПРАКТИКА И ПРОВЕРКА
+  Урок 7.1: Как анализировать политическое событие
+  Урок 7.2: Как сравнивать страны и режимы
+  Урок 7.3: Как видеть причины и последствия
+  Урок 7.4: Мини-экзамен
+  Урок 7.5: Финальная проверка
+
+КАК ВЕСТИ УРОКИ:
+1) Начинай урок с названия темы
+2) Объясняй по структуре:
+   🔷 Что это
+   🔷 Почему это важно
+   🔷 Как это работает
+   🔷 Исторический или жизненный пример
+   🔷 С чем это часто путают
+   🔷 Типичная ошибка новичка
+   🔷 2-3 вопроса на закрепление
+3) Не переходи дальше, пока ученик не понял основу
+4) В конце каждого урока обязательно давай:
+   📝 ДОМАШНЕЕ ЗАДАНИЕ:
+   [короткое практическое задание по теме]
+5) После домашнего задания предложи следующий урок
+
+ПРАВИЛА ОБЩЕНИЯ:
+- Пиши по-русски
+- Простыми словами
+- Без воды
+- Если тема сложная — сначала объясни очень просто, потом глубже
+- Если ученик пишет "не понял", объясни через аналогию из жизни
+- Не агитируй и не продвигай политические силы
+- Объясняй учебно и нейтрально
+- Отвечай как сильный репетитор, а не как сухая энциклопедия
+"""
+
+# ------------------- MODULES -------------------
+MODULES = {
+    "1": {
+        "name": "📘 Модуль 1 — База политики",
+        "lessons": [
+            ("1.1", "Что такое политика"),
+            ("1.2", "Что такое государство"),
+            ("1.3", "Что такое власть"),
+            ("1.4", "Суверенитет, закон, легитимность"),
+            ("1.5", "Общество, элиты, институты"),
+        ],
+    },
+    "2": {
+        "name": "🏛 Модуль 2 — Государственное устройство",
+        "lessons": [
+            ("2.1", "Монархия и республика"),
+            ("2.2", "Парламентская и президентская система"),
+            ("2.3", "Федерация и унитарное государство"),
+            ("2.4", "Разделение властей"),
+            ("2.5", "Конституция и законы"),
+        ],
+    },
+    "3": {
+        "name": "⚖️ Модуль 3 — Политические режимы",
+        "lessons": [
+            ("3.1", "Демократия"),
+            ("3.2", "Авторитаризм"),
+            ("3.3", "Тоталитаризм"),
+            ("3.4", "Диктатура и признаки режима"),
+            ("3.5", "Сравнение режимов"),
+        ],
+    },
+    "4": {
+        "name": "🧠 Модуль 4 — Идеологии",
+        "lessons": [
+            ("4.1", "Либерализм"),
+            ("4.2", "Консерватизм"),
+            ("4.3", "Социализм"),
+            ("4.4", "Коммунизм"),
+            ("4.5", "Национализм"),
+            ("4.6", "Фашизм"),
+            ("4.7", "Сравнение идеологий"),
+        ],
+    },
+    "5": {
+        "name": "📜 Модуль 5 — Исторические события",
+        "lessons": [
+            ("5.1", "Французская революция"),
+            ("5.2", "Наполеон и Европа"),
+            ("5.3", "Первая мировая война"),
+            ("5.4", "Вторая мировая война"),
+            ("5.5", "СССР"),
+            ("5.6", "Холодная война"),
+            ("5.7", "Распад СССР"),
+        ],
+    },
+    "6": {
+        "name": "🌍 Модуль 6 — Международные отношения",
+        "lessons": [
+            ("6.1", "Что такое геополитика"),
+            ("6.2", "Государства и интересы"),
+            ("6.3", "Союзы и блоки"),
+            ("6.4", "ООН, НАТО, ЕС"),
+            ("6.5", "Причины конфликтов"),
+            ("6.6", "Санкции, дипломатия, баланс сил"),
+        ],
+    },
+    "7": {
+        "name": "🎯 Модуль 7 — Практика и проверка",
+        "lessons": [
+            ("7.1", "Как анализировать политическое событие"),
+            ("7.2", "Как сравнивать страны и режимы"),
+            ("7.3", "Причины и последствия"),
+            ("7.4", "Мини-экзамен"),
+            ("7.5", "Финальная проверка"),
+        ],
+    },
+}
+
+# ------------------- KEYBOARDS -------------------
+def main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📚 Все уроки", callback_data="show_modules")],
+        [InlineKeyboardButton("▶️ Начать с первого урока", callback_data="lesson_1.1")],
+        [InlineKeyboardButton("📈 Мой прогресс", callback_data="progress")],
+        [InlineKeyboardButton("🔄 Сбросить историю", callback_data="reset")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def modules_keyboard():
+    keyboard = []
+    for mod_id, mod_data in MODULES.items():
+        keyboard.append([InlineKeyboardButton(mod_data["name"], callback_data=f"module_{mod_id}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+def lessons_keyboard(module_id: str):
+    module = MODULES[module_id]
+    keyboard = []
+    for lesson_id, lesson_name in module["lessons"]:
+        keyboard.append([InlineKeyboardButton(f"📖 {lesson_id} — {lesson_name}", callback_data=f"lesson_{lesson_id}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад к модулям", callback_data="show_modules")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ------------------- HELPERS -------------------
+async def send_long_text(bot, chat_id: int, text: str, reply_markup=None, chunk_size: int = 3500):
+    if not text:
+        text = "(пустой ответ)"
+    for i in range(0, len(text), chunk_size):
+        part = text[i:i + chunk_size]
+        await bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            reply_markup=reply_markup if i == 0 else None
         )
-        """
-    )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
+def get_user_history(user_id: int):
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+    return chat_histories[user_id]
 
-    conn.commit()
-    conn.close()
-
-
-# =========================
-# РАБОТА С ПОЛЬЗОВАТЕЛЕМ
-# =========================
-def ensure_user(user_id: int, username: Optional[str], full_name: str) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    exists = cur.fetchone()
-
-    if exists:
-        cur.execute(
-            """
-            UPDATE users
-            SET username = ?, full_name = ?, last_seen = ?
-            WHERE user_id = ?
-            """,
-            (username, full_name, datetime.utcnow().isoformat(), user_id),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO users (user_id, username, full_name, last_seen)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, username, full_name, datetime.utcnow().isoformat()),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def update_level(user_id: int, level: str) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET level = ? WHERE user_id = ?", (level, user_id))
-    conn.commit()
-    conn.close()
-
-
-def update_topic(user_id: int, topic: Optional[str]) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET current_topic = ? WHERE user_id = ?", (topic, user_id))
-    conn.commit()
-    conn.close()
-
-
-def increment_messages(user_id: int) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET messages_count = COALESCE(messages_count, 0) + 1 WHERE user_id = ?",
-        (user_id,),
-    )
-    conn.commit()
-    conn.close()
-
-
-def increment_tests(user_id: int) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET tests_count = COALESCE(tests_count, 0) + 1 WHERE user_id = ?",
-        (user_id,),
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_message(user_id: int, role: str, content: str) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
-        (user_id, role, content),
-    )
-    conn.commit()
-    conn.close()
-
-
-def clear_history(user_id: int) -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_recent_history(user_id: int, limit: int = 12) -> list[dict]:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT role, content
-        FROM messages
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    rows = list(reversed(rows))
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
-
-
-# =========================
-# XAI / GROK
-# =========================
-def build_user_prompt(
-    user_level: str,
-    current_topic: Optional[str],
-    user_text: str,
-    mode: str = "normal",
-) -> str:
-    payload = {
-        "user_level": user_level,
-        "current_topic": current_topic,
-        "mode": mode,
-        "user_request": user_text,
-        "response_rules": {
-            "language": "ru",
-            "style": "понятно, структурно, как сильный репетитор",
-            "ask_follow_up_questions": True,
-        },
-    }
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def extract_text_from_response(response) -> str:
-    if hasattr(response, "output") and response.output:
-        for item in response.output:
-            if getattr(item, "type", None) == "message":
-                for content in getattr(item, "content", []):
-                    if getattr(content, "type", None) == "output_text":
-                        return getattr(content, "text", "").strip()
-    return "Не удалось получить ответ от Grok."
-
-
-def ask_tutor(user_id: int, user_text: str, mode: str = "normal") -> str:
-    user = get_user(user_id)
-    level = user["level"] if user else "Новичок"
-    topic = user["current_topic"] if user else None
-
-    history = get_recent_history(user_id, limit=10)
-
-    input_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    input_messages.extend(history)
-    input_messages.append(
-        {
-            "role": "user",
-            "content": build_user_prompt(level, topic, user_text, mode=mode),
+def get_user_progress(user_id: int):
+    if user_id not in user_progress:
+        user_progress[user_id] = {
+            "current_lesson": None,
+            "completed_lessons": []
         }
+    return user_progress[user_id]
+
+def trim_history(history, max_items: int = 30):
+    if len(history) > max_items:
+        return history[-max_items:]
+    return history
+
+def groq_answer(history):
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+        max_tokens=1200,
+        temperature=0.7,
     )
+    return response.choices[0].message.content
 
-    response = client.responses.create(
-        model=XAI_MODEL,
-        input=input_messages,
-    )
-    return extract_text_from_response(response)
+def mark_lesson_started(user_id: int, lesson_id: str):
+    progress = get_user_progress(user_id)
+    progress["current_lesson"] = lesson_id
 
+def mark_lesson_completed(user_id: int, lesson_id: str):
+    progress = get_user_progress(user_id)
+    if lesson_id not in progress["completed_lessons"]:
+        progress["completed_lessons"].append(lesson_id)
 
-# =========================
-# ТЕКСТЫ ДЛЯ БЫСТРЫХ ДЕЙСТВИЙ
-# =========================
-def lesson_prompt_for_topic(topic: str) -> str:
+def build_progress_text(user_id: int) -> str:
+    progress = get_user_progress(user_id)
+    completed = progress["completed_lessons"]
+    current = progress["current_lesson"] or "ещё не выбран"
+
+    total_lessons = sum(len(module["lessons"]) for module in MODULES.values())
+
     return (
-        f"Проведи мне мини-урок по теме '{topic}'. "
-        "Сначала объясни очень просто, затем дай более точную структуру. "
-        "Добавь примеры, ключевые идеи, а в конце задай 3 вопроса для проверки."
+        "📈 Твой прогресс\n\n"
+        f"Текущий урок: {current}\n"
+        f"Пройдено уроков: {len(completed)} из {total_lessons}\n\n"
+        f"Список пройденных: {', '.join(completed) if completed else 'пока пусто'}"
     )
 
-
-def test_prompt(current_topic: Optional[str]) -> str:
-    if current_topic:
-        return (
-            f"Сделай мини-тест по теме '{current_topic}'. "
-            "Дай 5 вопросов разного типа без ответов сразу. "
-            "В конце попроси меня ответить по пунктам."
-        )
-    return (
-        "Сделай общий мини-тест по базовой политике и истории. "
-        "Дай 5 вопросов без ответов сразу. В конце попроси меня ответить по пунктам."
-    )
-
-
-def repeat_prompt(current_topic: Optional[str]) -> str:
-    if current_topic:
-        return (
-            f"Повтори тему '{current_topic}' кратко и понятно. "
-            "Сделай это как повторение перед тестом: самое важное, ключевые различия, 3 контрольных вопроса."
-        )
-    return "Выбери базовую тему по политике для повторения и кратко объясни её."
-
-
-# =========================
-# TELEGRAM HANDLERS
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    ensure_user(user.id, user.username, user.full_name)
-
-    text = (
-        f"Привет, {user.first_name}.\n\n"
-        "Я твой AI-репетитор по политике, истории и идеологиям.\n"
-        "Могу объяснять темы по шагам, проводить мини-уроки и делать тесты.\n\n"
-        "Выбери действие на клавиатуре ниже."
-    )
-    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
-
-
-async def topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Выбери тему:", reply_markup=TOPIC_KEYBOARD)
-
-
-async def level_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Выбери уровень обучения:", reply_markup=LEVEL_KEYBOARD)
-
-
-async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    if not user:
-        await update.message.reply_text("Сначала нажми /start")
-        return
-
-    text = (
-        "Твой прогресс:\n\n"
-        f"Уровень: {user['level']}\n"
-        f"Текущая тема: {user['current_topic'] or 'не выбрана'}\n"
-        f"Сообщений в обучении: {user['messages_count']}\n"
-        f"Мини-тестов: {user['tests_count']}"
-    )
-    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
-
-
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    clear_history(user_id)
-    update_topic(user_id, None)
+# ------------------- HANDLERS -------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "История диалога и текущая тема сброшены.",
-        reply_markup=MAIN_KEYBOARD,
+        "Привет.\n\n"
+        "Я твой AI-репетитор по политике, идеологиям, истории и международным отношениям.\n\n"
+        "У тебя здесь полноценная программа обучения с уроками, вопросами и домашними заданиями.\n\n"
+        "Выбери, с чего начать.",
+        reply_markup=main_menu_keyboard(),
     )
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
+    if data == "main_menu":
+        await query.edit_message_text("Главное меню:", reply_markup=main_menu_keyboard())
         return
 
-    user = update.effective_user
-    ensure_user(user.id, user.username, user.full_name)
-    text = update.message.text.strip()
-
-    if text == "ℹ️ Помощь":
-        await update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
+    if data == "show_modules":
+        await query.edit_message_text("📚 Выбери модуль:", reply_markup=modules_keyboard())
         return
 
-    if text == "🧠 Выбрать тему":
-        await update.message.reply_text("Выбери тему:", reply_markup=TOPIC_KEYBOARD)
-        return
-
-    if text == "⚙️ Сменить уровень":
-        await update.message.reply_text("Выбери уровень:", reply_markup=LEVEL_KEYBOARD)
-        return
-
-    if text == "📈 Мой прогресс":
-        await progress_command(update, context)
-        return
-
-    if text == "⬅️ Назад":
-        await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
-        return
-
-    if text in LEVELS:
-        update_level(user.id, text)
-        await update.message.reply_text(
-            f"Уровень изменён на: {text}",
-            reply_markup=MAIN_KEYBOARD,
+    if data == "progress":
+        await query.edit_message_text(
+            build_progress_text(user_id),
+            reply_markup=main_menu_keyboard()
         )
         return
 
-    topic_buttons = {
-        "Государство",
-        "Формы правления",
-        "Демократия",
-        "Авторитаризм",
-        "Либерализм",
-        "Консерватизм",
-        "Социализм",
-        "Национализм",
-        "Французская революция",
-        "Первая мировая",
-        "Вторая мировая",
-        "Холодная война",
-        "СССР",
-        "Международные отношения",
-    }
-
-    if text in topic_buttons:
-        update_topic(user.id, text)
-        prompt = lesson_prompt_for_topic(text)
-
-        await update.message.reply_text("Готовлю мини-урок...")
-        answer = ask_tutor(user.id, prompt, mode="lesson")
-
-        save_message(user.id, "user", prompt)
-        save_message(user.id, "assistant", answer)
-        increment_messages(user.id)
-
-        await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
-        return
-
-    if text == "📚 Начать обучение":
-        prompt = (
-            "Начни первое занятие по политике для меня. "
-            "Сначала объясни, что такое политика, государство и власть. "
-            "Сделай это доступно, как вводный урок, и в конце задай 3 вопроса."
-        )
-        await update.message.reply_text("Начинаем обучение...")
-        answer = ask_tutor(user.id, prompt, mode="lesson")
-
-        save_message(user.id, "user", prompt)
-        save_message(user.id, "assistant", answer)
-        increment_messages(user.id)
-
-        await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
-        return
-
-    if text == "📝 Мини-тест":
-        current_user = get_user(user.id)
-        current_topic = current_user["current_topic"] if current_user else None
-        prompt = test_prompt(current_topic)
-
-        await update.message.reply_text("Составляю мини-тест...")
-        answer = ask_tutor(user.id, prompt, mode="test")
-
-        save_message(user.id, "user", prompt)
-        save_message(user.id, "assistant", answer)
-        increment_messages(user.id)
-        increment_tests(user.id)
-
-        await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
-        return
-
-    if text == "🔁 Повторить тему":
-        current_user = get_user(user.id)
-        current_topic = current_user["current_topic"] if current_user else None
-        prompt = repeat_prompt(current_topic)
-
-        await update.message.reply_text("Делаю краткое повторение...")
-        answer = ask_tutor(user.id, prompt, mode="repeat")
-
-        save_message(user.id, "user", prompt)
-        save_message(user.id, "assistant", answer)
-        increment_messages(user.id)
-
-        await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
-        return
-
-    if text == "❓ Задать вопрос":
-        await update.message.reply_text(
-            "Напиши любой вопрос по политике, истории, идеологиям или государственному устройству.",
-            reply_markup=MAIN_KEYBOARD,
+    if data.startswith("module_"):
+        module_id = data.split("_", 1)[1]
+        module = MODULES.get(module_id)
+        if not module:
+            await query.edit_message_text("Такого модуля нет.", reply_markup=modules_keyboard())
+            return
+        await query.edit_message_text(
+            f"{module['name']}\n\nВыбери урок:",
+            reply_markup=lessons_keyboard(module_id)
         )
         return
 
-    await update.message.reply_text("Думаю над ответом...")
-    answer = ask_tutor(user.id, text, mode="normal")
+    if data == "reset":
+        chat_histories.pop(user_id, None)
+        user_progress.pop(user_id, None)
+        await query.edit_message_text(
+            "История и прогресс очищены.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
-    save_message(user.id, "user", text)
-    save_message(user.id, "assistant", answer)
-    increment_messages(user.id)
+    if data.startswith("lesson_"):
+        lesson_id = data.split("_", 1)[1]
+        history = get_user_history(user_id)
+        mark_lesson_started(user_id, lesson_id)
 
-    await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
+        lesson_prompt = (
+            f"Начни урок {lesson_id} по программе. "
+            f"Проведи полный урок по структуре: что это, почему важно, как работает, пример, с чем путают, ошибка новичка, 2-3 вопроса на закрепление. "
+            f"В конце обязательно дай домашнее задание и предложи следующий урок."
+        )
 
+        history.append({"role": "user", "content": lesson_prompt})
+        chat_histories[user_id] = trim_history(history)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Ошибка во время обработки апдейта:", exc_info=context.error)
+        try:
+            await query.edit_message_text(f"⏳ Загружаю урок {lesson_id}...")
+        except Exception:
+            pass
 
+        try:
+            reply = groq_answer(chat_histories[user_id])
+            chat_histories[user_id].append({"role": "assistant", "content": reply})
+            chat_histories[user_id] = trim_history(chat_histories[user_id])
 
-# =========================
-# ЗАПУСК
-# =========================
-def main() -> None:
-    init_db()
+            keyboard = [
+                [InlineKeyboardButton("✅ Отметить урок как пройденный", callback_data=f"complete_{lesson_id}")],
+                [InlineKeyboardButton("📚 Выбрать другой урок", callback_data="show_modules")]
+            ]
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+            await send_long_text(
+                context.bot,
+                query.message.chat_id,
+                reply,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        except Exception as e:
+            logging.exception("Ошибка в уроке: %s", e)
+            await context.bot.send_message(chat_id=query.message.chat_id, text="Ошибка, попробуй ещё раз.")
+        return
 
+    if data.startswith("complete_"):
+        lesson_id = data.split("_", 1)[1]
+        mark_lesson_completed(user_id, lesson_id)
+        await query.edit_message_text(
+            f"Урок {lesson_id} отмечен как пройденный.\n\n"
+            f"{build_progress_text(user_id)}",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_message = (update.message.text or "").strip()
+
+    if not user_message:
+        return
+
+    history = get_user_history(user_id)
+    history.append({"role": "user", "content": user_message})
+    chat_histories[user_id] = trim_history(history)
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
+
+        reply = groq_answer(chat_histories[user_id])
+        chat_histories[user_id].append({"role": "assistant", "content": reply})
+        chat_histories[user_id] = trim_history(chat_histories[user_id])
+
+        keyboard = [[InlineKeyboardButton("📚 Выбрать урок", callback_data="show_modules")]]
+
+        await send_long_text(
+            context.bot,
+            update.effective_chat.id,
+            reply,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as e:
+        logging.exception("Ошибка в сообщении: %s", e)
+        await update.message.reply_text("Ошибка, попробуй ещё раз.")
+
+# ------------------- RUN -------------------
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("topic", topic_command))
-    app.add_handler(CommandHandler("level", level_command))
-    app.add_handler(CommandHandler("progress", progress_command))
-    app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Бот запущен")
+    logging.info("Бот запущен")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
